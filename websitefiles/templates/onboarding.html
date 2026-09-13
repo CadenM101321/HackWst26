@@ -35,7 +35,10 @@
     <form method="POST" action="{{ url_for('views.onboarding') }}">
 
       <h2 class="h5">1. I am a...</h2>
-      <div class="btn-group btn-group-toggle d-flex mb-4" data-toggle="buttons">
+      {# No data-toggle="buttons" on purpose. Bootstrap 4.0's button plugin cancels the
+         click and announces the change through jQuery only, which native listeners
+         never hear - the questions and Save button would never appear. #}
+      <div class="btn-group btn-group-toggle d-flex mb-4">
         <label class="btn btn-outline-success w-100 {% if values.get('role') == 'student' %}active{% endif %}">
           <input type="radio" name="role" value="student" required {% if values.get('role') == 'student' %}checked{% endif %}> Student
         </label>
@@ -112,6 +115,9 @@
   (function () {
     const sections = document.querySelectorAll('.role-section');
     function show(role) {
+      document.querySelectorAll('input[name="role"]').forEach(function (radio) {
+        radio.closest('label').classList.toggle('active', radio.value === role);
+      });
       sections.forEach(function (section) {
         const active = section.dataset.role === role;
         section.hidden = !active;
