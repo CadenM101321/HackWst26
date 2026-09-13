@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block title %}Your tutor matches{% endblock %}
+
+{% block content %}
+<div class="my-4">
+  <div class="d-flex flex-wrap justify-content-between align-items-start mb-3">
+    <div class="mr-3">
+      <h1 class="h3 mb-1">Your top matches</h1>
+      <p class="text-muted mb-0">Ranked by how well each tutor's teaching style fits how you learn.</p>
+    </div>
+    <a class="btn btn-outline-secondary btn-sm mt-2" href="{{ url_for('views.onboarding') }}">Retake quiz</a>
+  </div>
+
+  <div class="alert alert-light border">
+    <strong>Your learning profile{% if grade_label %} &middot; {{ grade_label }}{% endif %}:</strong>
+    {{ sentence }}
+  </div>
+
+  {% if not matches %}
+    <div class="card shadow-sm">
+      <div class="card-body">
+        <h2 class="h5">No tutors match yet</h2>
+        <p class="mb-0">Nobody teaches those subjects at your grade level right now. Try adding more subjects,
+          or <a href="{{ url_for('views.onboarding') }}">update your profile</a>.</p>
+      </div>
+    </div>
+  {% endif %}
+
+  {% for m in matches %}
+    <div class="card shadow-sm mb-3">
+      <div class="card-body">
+        <div class="d-flex">
+          {% if m.user.avatar_url %}
+            <img src="{{ m.user.avatar_url }}" alt="" width="64" height="64" class="rounded-circle mr-3 flex-shrink-0">
+          {% endif %}
+          <div class="flex-grow-1" style="min-width: 0;">
+            <div class="d-flex flex-wrap justify-content-between align-items-baseline">
+              <h2 class="h5 mb-1 mr-2">
+                {% if loop.first %}<span class="badge badge-success align-middle mr-1">Best match</span>{% endif %}
+                {{ m.user.name }}
+              </h2>
+              <span class="text-muted">{{ (m.score * 100) | round | int }}% match</span>
+            </div>
+            <p class="text-success mb-2"><em>{{ m.rationale }}</em></p>
+            <p class="mb-2">{{ m.bio }}</p>
+            <div class="small text-muted">
+              &#9733; {{ "%.1f" | format(m.rating) }}
+              &middot; {{ "%.2f" | format(m.hourly_rate_sol) }} SOL / hour
+              &middot; {% for s in m.subjects %}{{ labels.get(s, s) }}{% if not loop.last %}, {% endif %}{% endfor %}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  {% endfor %}
+</div>
+{% endblock %}

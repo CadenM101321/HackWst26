@@ -131,6 +131,7 @@ class TutorMatch(_Dictable):
     # Component scores, kept for debugging the ranking.
     style_similarity: float = 0.0
     subject_overlap: float = 0.0
+    teaching_levels: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -157,6 +158,7 @@ class TutorFixture:
     hourly_rate_sol: float
     rating: float
     style: dict[str, dict[str, float]] = field(default_factory=dict)
+    teaching_levels: list[str] = field(default_factory=list)
 
 
 # =====================================================================
@@ -187,6 +189,7 @@ CREATE TABLE IF NOT EXISTS learner_profiles (
   -- scores against, so keep it readable: {"intake": "visual", "pace": "slow"}
   raw_answers       jsonb,
   profile_sentence  text,
+  grade_level       text,           -- one of GRADE_LEVELS, e.g. 'high'
   updated_at        timestamptz NOT NULL DEFAULT now()
 );
 
@@ -197,7 +200,8 @@ CREATE TABLE IF NOT EXISTS tutor_profiles (
   -- {"intake": {"visual": 1.0, "verbal": 0.3, ...}, "pace": {...}, ...}
   style_affinity    jsonb,
   hourly_rate_sol   numeric(10,4),
-  rating            numeric(3,2) DEFAULT 4.5
+  rating            numeric(3,2) DEFAULT 4.5,
+  teaching_levels   text[]          -- GRADE_LEVELS values this tutor teaches
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -282,6 +286,10 @@ CREATE INDEX IF NOT EXISTS sessions_student
 -- Migration for databases created before room_key existed. No-op otherwise.
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS room_key text;
 CREATE UNIQUE INDEX IF NOT EXISTS sessions_room_key ON sessions (room_key);
+
+-- Migration for databases created before grade/teaching levels existed.
+ALTER TABLE learner_profiles ADD COLUMN IF NOT EXISTS grade_level text;
+ALTER TABLE tutor_profiles   ADD COLUMN IF NOT EXISTS teaching_levels text[];
 """
 
 _pool: ConnectionPool | None = None
@@ -411,27 +419,93 @@ def save_learner_profile(
     goals: str,
     raw_answers: dict[str, Any],
     profile_sentence: str,
+    grade_level: str | None = None,
 ) -> None:
     """Store the quiz answers. raw_answers is what matching scores against."""
     execute(
         """
         INSERT INTO learner_profiles
-            (user_id, subjects, pace, goals, raw_answers, profile_sentence, updated_at)
-        VALUES (%s, %s, %s, %s, %s, %s, now())
+            (user_id, subjects, pace, goals, raw_answers, profile_sentence, grade_level, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, now())
         ON CONFLICT (user_id) DO UPDATE SET
             subjects         = EXCLUDED.subjects,
             pace             = EXCLUDED.pace,
             goals            = EXCLUDED.goals,
             raw_answers      = EXCLUDED.raw_answers,
             profile_sentence = EXCLUDED.profile_sentence,
+            grade_level      = EXCLUDED.grade_level,
             updated_at       = now()
         """,
-        (user_id, subjects, pace, goals, Json(raw_answers), profile_sentence),
+        (user_id, subjects, pace, goals, Json(raw_answers), profile_sentence, grade_level),
     )
 
 
 def get_learner_profile(user_id: str) -> dict[str, Any] | None:
     return fetch_one("SELECT * FROM learner_profiles WHERE user_id = %s", (user_id,))
+
+
+def set_user_role(auth_sub: str, role: str) -> None:
+    """Make someone a student or a tutor.
+
+    Becoming a student removes any tutor profile, so a person who switches
+    roles stops appearing in other students' matches.
+    """
+    if role not in ("student", "tutor"):
+        raise ValueError(f"role must be 'student' or 'tutor', not {role!r}")
+    execute("UPDATE users SET role = %s WHERE auth_sub = %s", (role, auth_sub))
+    if role == "student":
+        execute("DELETE FROM tutor_profiles WHERE user_id = %s", (auth_sub,))
+
+
+def save_tutor_profile(
+    user_id: str,
+    *,
+    bio: str,
+    subjects: list[str],
+    teaching_levels: list[str],
+    style_affinity: dict[str, dict[str, float]],
+    hourly_rate_sol: float,
+) -> None:
+    """Make a real account matchable as a tutor. Rating keeps its existing value."""
+    execute(
+        """
+        INSERT INTO tutor_profiles
+            (user_id, bio, subjects, teaching_levels, style_affinity, hourly_rate_sol)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (user_id) DO UPDATE SET
+            bio             = EXCLUDED.bio,
+            subjects        = EXCLUDED.subjects,
+            teaching_levels = EXCLUDED.teaching_levels,
+            style_affinity  = EXCLUDED.style_affinity,
+            hourly_rate_sol = EXCLUDED.hourly_rate_sol
+        """,
+        (user_id, bio, subjects, teaching_levels, Json(style_affinity), hourly_rate_sol),
+    )
+
+
+def get_tutor_profile(user_id: str) -> dict[str, Any] | None:
+    return fetch_one("SELECT * FROM tutor_profiles WHERE user_id = %s", (user_id,))
+
+
+def get_profile(auth_sub: str) -> dict[str, Any] | None:
+    """Everything about one person: their user row and whichever profiles exist."""
+    user = get_user(auth_sub)
+    if user is None:
+        return None
+    return {
+        "user": user,
+        "learner": get_learner_profile(auth_sub),
+        "tutor": get_tutor_profile(auth_sub),
+    }
+
+
+def is_onboarded(auth_sub: str) -> bool:
+    """True once someone has a profile for their current role."""
+    profile = get_profile(auth_sub)
+    if profile is None:
+        return False
+    key = "tutor" if profile["user"]["role"] == "tutor" else "learner"
+    return profile[key] is not None
 
 
 # ----------------------------------------------------------------- sessions
@@ -789,6 +863,109 @@ QUIZ_QUESTIONS: list[QuizQuestion] = [
     ),
 ]
 
+# Students pick one; tutors pick every level they teach. Matching only pairs a
+# student with tutors who teach their level.
+GRADE_LEVELS: list[QuizOption] = [
+    QuizOption("elementary", "Elementary (K-5)"),
+    QuizOption("middle", "Middle school (6-8)"),
+    QuizOption("high", "High school (9-12)"),
+    QuizOption("college", "College"),
+    QuizOption("adult", "Adult / professional"),
+]
+
+SUBJECTS: list[QuizOption] = [
+    QuizOption("calculus", "Calculus"),
+    QuizOption("physics", "Physics"),
+    QuizOption("chemistry", "Chemistry"),
+    QuizOption("biology", "Biology"),
+    QuizOption("computer_science", "Computer science"),
+]
+
+# The same questions asked from the tutor's side. Answer values are identical
+# to QUIZ_QUESTIONS on purpose: a tutor's "how I teach" answer is scored
+# directly against a student's "how I learn" answer.
+TEACHING_QUESTIONS: list[QuizQuestion] = [
+    QuizQuestion(
+        id="intake",
+        prompt="How do you usually get a new idea across?",
+        options=[
+            QuizOption("visual", "Draw it - diagrams and pictures"),
+            QuizOption("verbal", "Talk it through out loud"),
+            QuizOption("reading", "Write out a clear explanation"),
+            QuizOption("kinesthetic", "Get them trying it hands-on"),
+        ],
+    ),
+    QuizQuestion(
+        id="explanation",
+        prompt="How do you usually explain something new?",
+        options=[
+            QuizOption("examples_first", "A worked example first, then the rule"),
+            QuizOption("theory_first", "The rule first, then we apply it"),
+            QuizOption("analogy", "An analogy to something familiar"),
+            QuizOption("discovery", "Let them explore until they work it out"),
+        ],
+    ),
+    QuizQuestion(
+        id="pace",
+        prompt="What pace do you usually teach at?",
+        options=[
+            QuizOption("slow", "Slow and thorough - every step"),
+            QuizOption("moderate", "Steady, with room for questions"),
+            QuizOption("fast", "Fast - highlights, skip the basics"),
+        ],
+    ),
+    QuizQuestion(
+        id="when_stuck",
+        prompt="When a student is stuck, what do you do?",
+        options=[
+            QuizOption("hint", "Give a small hint and let them keep trying"),
+            QuizOption("walkthrough", "Walk them through it start to finish"),
+            QuizOption("socratic", "Ask questions until they find it"),
+            QuizOption("similar_example", "Solve a similar problem, then hand it back"),
+        ],
+    ),
+    QuizQuestion(
+        id="structure",
+        prompt="How do you run a session?",
+        options=[
+            QuizOption("agenda", "A clear agenda we work through"),
+            QuizOption("freeform", "Freeform - they bring the questions"),
+            QuizOption("drilling", "Lots of practice problems"),
+            QuizOption("discussion", "Discussion of the underlying concepts"),
+        ],
+    ),
+]
+
+
+def clean_answers(submitted: dict[str, Any], questions: list[QuizQuestion]) -> dict[str, str]:
+    """Keep only answers that are real options for these questions.
+
+    Form input can't be trusted, and matching looks answers up by value, so an
+    unknown value would silently score zero instead of failing loudly.
+    """
+    cleaned: dict[str, str] = {}
+    for q in questions:
+        value = str(submitted.get(q.id) or "").strip()
+        if q.free_text:
+            if value:
+                cleaned[q.id] = value[:500]
+        elif value in {o.value for o in q.options}:
+            cleaned[q.id] = value
+    return cleaned
+
+
+def style_from_teaching_answers(answers: dict[str, str]) -> dict[str, dict[str, float]]:
+    """Turn a tutor's quiz answers into the affinity scores matching runs on.
+
+    The answer they picked scores 1.0 on each axis; the alternatives 0.25, since
+    most tutors can still flex toward other styles. Seeded tutors have
+    hand-tuned scores instead - this is the version real accounts get.
+    """
+    return {
+        q.id: {o.value: (1.0 if o.value == answers.get(q.id) else 0.25) for o in q.options}
+        for q in TEACHING_QUESTIONS
+    }
+
 
 # =====================================================================
 # 5. TUTORS - the seeded pool
@@ -814,6 +991,7 @@ TUTORS: list[TutorFixture] = [
             "when_stuck": {"similar_example": 0.8, "walkthrough": 0.7, "hint": 0.4, "socratic": 0.3},
             "structure": {"agenda": 0.5, "discussion": 0.5, "freeform": 0.5, "drilling": 0.3},
         },
+        teaching_levels=["high", "college"],
     ),
     TutorFixture(
         "seed|tutor-02", "Dev Raghunathan", "dev@tutormatch.tech",
@@ -829,6 +1007,7 @@ TUTORS: list[TutorFixture] = [
             "when_stuck": {"similar_example": 0.9, "hint": 0.6, "walkthrough": 0.4, "socratic": 0.2},
             "structure": {"drilling": 1.0, "agenda": 0.6, "freeform": 0.2, "discussion": 0.1},
         },
+        teaching_levels=["high", "college"],
     ),
     TutorFixture(
         "seed|tutor-03", "Priya Venkatesan", "priya@tutormatch.tech",
@@ -845,6 +1024,7 @@ TUTORS: list[TutorFixture] = [
             "when_stuck": {"socratic": 1.0, "hint": 0.8, "similar_example": 0.2, "walkthrough": 0.0},
             "structure": {"discussion": 0.9, "freeform": 0.7, "agenda": 0.3, "drilling": 0.1},
         },
+        teaching_levels=["high", "college", "adult"],
     ),
     TutorFixture(
         "seed|tutor-04", "Tomas Lindqvist", "tomas@tutormatch.tech",
@@ -861,6 +1041,7 @@ TUTORS: list[TutorFixture] = [
             "when_stuck": {"walkthrough": 0.7, "socratic": 0.4, "similar_example": 0.4, "hint": 0.3},
             "structure": {"agenda": 0.8, "discussion": 0.8, "drilling": 0.3, "freeform": 0.3},
         },
+        teaching_levels=["college", "adult"],
     ),
     TutorFixture(
         "seed|tutor-05", "Rosa Delgado", "rosa@tutormatch.tech",
@@ -877,6 +1058,7 @@ TUTORS: list[TutorFixture] = [
             "when_stuck": {"walkthrough": 0.9, "similar_example": 0.6, "hint": 0.4, "socratic": 0.2},
             "structure": {"freeform": 0.8, "discussion": 0.7, "agenda": 0.4, "drilling": 0.2},
         },
+        teaching_levels=["middle", "high", "college", "adult"],
     ),
     TutorFixture(
         "seed|tutor-06", "Ken Arai", "ken@tutormatch.tech",
@@ -893,6 +1075,7 @@ TUTORS: list[TutorFixture] = [
             "when_stuck": {"walkthrough": 0.8, "similar_example": 0.7, "hint": 0.3, "socratic": 0.2},
             "structure": {"agenda": 1.0, "drilling": 0.6, "discussion": 0.3, "freeform": 0.1},
         },
+        teaching_levels=["middle", "high", "college"],
     ),
     TutorFixture(
         "seed|tutor-07", "Amara Boateng", "amara@tutormatch.tech",
@@ -908,6 +1091,7 @@ TUTORS: list[TutorFixture] = [
             "when_stuck": {"similar_example": 0.6, "walkthrough": 0.6, "hint": 0.5, "socratic": 0.4},
             "structure": {"discussion": 0.8, "agenda": 0.5, "freeform": 0.5, "drilling": 0.2},
         },
+        teaching_levels=["high", "college"],
     ),
     TutorFixture(
         "seed|tutor-08", "Colin Mbeki", "colin@tutormatch.tech",
@@ -923,6 +1107,7 @@ TUTORS: list[TutorFixture] = [
             "when_stuck": {"similar_example": 0.9, "walkthrough": 0.8, "hint": 0.3, "socratic": 0.1},
             "structure": {"drilling": 1.0, "agenda": 0.7, "freeform": 0.2, "discussion": 0.1},
         },
+        teaching_levels=["high", "college"],
     ),
     TutorFixture(
         "seed|tutor-09", "Hannah Weiss", "hannah@tutormatch.tech",
@@ -939,6 +1124,7 @@ TUTORS: list[TutorFixture] = [
             "when_stuck": {"hint": 0.8, "socratic": 0.6, "similar_example": 0.4, "walkthrough": 0.3},
             "structure": {"freeform": 0.7, "discussion": 0.6, "agenda": 0.4, "drilling": 0.2},
         },
+        teaching_levels=["elementary", "middle", "high"],
     ),
     TutorFixture(
         "seed|tutor-10", "Yusuf Karim", "yusuf@tutormatch.tech",
@@ -955,6 +1141,7 @@ TUTORS: list[TutorFixture] = [
             "when_stuck": {"walkthrough": 0.8, "similar_example": 0.6, "hint": 0.4, "socratic": 0.3},
             "structure": {"agenda": 0.7, "discussion": 0.5, "freeform": 0.5, "drilling": 0.3},
         },
+        teaching_levels=["high", "college", "adult"],
     ),
     TutorFixture(
         "seed|tutor-11", "Grace Sullivan", "grace@tutormatch.tech",
@@ -971,6 +1158,7 @@ TUTORS: list[TutorFixture] = [
             "when_stuck": {"hint": 0.9, "socratic": 0.6, "similar_example": 0.4, "walkthrough": 0.2},
             "structure": {"freeform": 1.0, "discussion": 0.4, "drilling": 0.2, "agenda": 0.2},
         },
+        teaching_levels=["high", "college", "adult"],
     ),
     TutorFixture(
         "seed|tutor-12", "Emeka Nwosu", "emeka@tutormatch.tech",
@@ -986,6 +1174,7 @@ TUTORS: list[TutorFixture] = [
             "when_stuck": {"similar_example": 0.7, "walkthrough": 0.7, "hint": 0.4, "socratic": 0.3},
             "structure": {"agenda": 0.7, "drilling": 0.6, "discussion": 0.4, "freeform": 0.3},
         },
+        teaching_levels=["college", "adult"],
     ),
     TutorFixture(
         "seed|tutor-13", "Sofia Marchetti", "sofia@tutormatch.tech",
@@ -1002,6 +1191,7 @@ TUTORS: list[TutorFixture] = [
             "when_stuck": {"socratic": 1.0, "hint": 0.8, "similar_example": 0.3, "walkthrough": 0.1},
             "structure": {"freeform": 0.8, "discussion": 0.5, "agenda": 0.3, "drilling": 0.2},
         },
+        teaching_levels=["high", "college", "adult"],
     ),
     TutorFixture(
         "seed|tutor-14", "Arjun Malhotra", "arjun@tutormatch.tech",
@@ -1018,6 +1208,7 @@ TUTORS: list[TutorFixture] = [
             "when_stuck": {"socratic": 0.5, "walkthrough": 0.5, "hint": 0.5, "similar_example": 0.3},
             "structure": {"discussion": 1.0, "agenda": 0.5, "drilling": 0.3, "freeform": 0.3},
         },
+        teaching_levels=["college", "adult"],
     ),
     TutorFixture(
         "seed|tutor-15", "Nadia Haddad", "nadia@tutormatch.tech",
@@ -1033,6 +1224,7 @@ TUTORS: list[TutorFixture] = [
             "when_stuck": {"walkthrough": 0.9, "similar_example": 0.6, "hint": 0.4, "socratic": 0.2},
             "structure": {"freeform": 0.8, "discussion": 0.6, "agenda": 0.4, "drilling": 0.2},
         },
+        teaching_levels=["elementary", "middle", "high", "college", "adult"],
     ),
     TutorFixture(
         "seed|tutor-16", "Leo Fitzgerald", "leo@tutormatch.tech",
@@ -1048,6 +1240,7 @@ TUTORS: list[TutorFixture] = [
             "when_stuck": {"hint": 0.8, "socratic": 0.6, "similar_example": 0.3, "walkthrough": 0.2},
             "structure": {"discussion": 0.8, "freeform": 0.7, "agenda": 0.3, "drilling": 0.3},
         },
+        teaching_levels=["college", "adult"],
     ),
 ]
 
@@ -1188,6 +1381,7 @@ WITH scored AS (
     SELECT
         u.auth_sub, u.name, u.email, u.avatar_url,
         tp.bio, tp.subjects, tp.hourly_rate_sol, tp.rating, tp.style_affinity,
+        tp.teaching_levels,
         ({_STYLE_SUM}) / {len(STYLE_AXES)}.0 AS style_score,
         CASE WHEN cardinality(%(subjects)s::text[]) = 0 THEN 1.0
              ELSE cardinality(ARRAY(SELECT unnest(tp.subjects)
@@ -1199,6 +1393,11 @@ WITH scored AS (
     WHERE tp.style_affinity IS NOT NULL
       AND (cardinality(%(subjects)s::text[]) = 0 OR tp.subjects && %(subjects)s::text[])
       AND (%(max_rate)s::numeric IS NULL OR tp.hourly_rate_sol <= %(max_rate)s::numeric)
+      -- Only tutors who teach the student's level. A tutor with no levels set
+      -- isn't excluded, so older profiles still appear until they're updated.
+      AND (%(grade)s::text IS NULL
+           OR coalesce(cardinality(tp.teaching_levels), 0) = 0
+           OR %(grade)s::text = ANY(tp.teaching_levels))
 )
 SELECT *,
        {W_STYLE} * style_score
@@ -1215,12 +1414,14 @@ def find_matches(
     subjects: list[str],
     *,
     max_rate: float | None = None,
+    grade_level: str | None = None,
     limit: int = 3,
 ) -> list[TutorMatch]:
-    """Rank tutors for a learner. Hard-filters on subject and price, then scores."""
+    """Rank tutors for a learner. Hard-filters on subject, price and level, then scores."""
     params: dict[str, Any] = {
         "subjects": subjects,
         "max_rate": max_rate,
+        "grade": grade_level,
         "limit": limit,
     }
     # Answers the student didn't give become a sentinel that matches no key,
@@ -1247,6 +1448,7 @@ def find_matches(
             style_similarity=round(float(r["style_score"]), 4),
             subject_overlap=round(float(r["subject_overlap"]), 4),
             rationale=explain(answers, r["style_affinity"] or {}),
+            teaching_levels=list(r["teaching_levels"] or []),
         )
         for r in rows
     ]
@@ -1257,6 +1459,7 @@ def match_for_answers(
     subjects: list[str],
     *,
     max_rate: float | None = None,
+    grade_level: str | None = None,
     limit: int = 3,
 ) -> tuple[str, list[TutorMatch]]:
     """Quiz answers straight to ranked tutors, plus the readable profile summary.
@@ -1264,7 +1467,9 @@ def match_for_answers(
     This is the main entry point for the website.
     """
     sentence = build_profile_sentence(answers, subjects)
-    return sentence, find_matches(answers, subjects, max_rate=max_rate, limit=limit)
+    return sentence, find_matches(
+        answers, subjects, max_rate=max_rate, grade_level=grade_level, limit=limit
+    )
 
 
 # =====================================================================
@@ -1358,16 +1563,18 @@ def cmd_seed() -> int:
         execute(
             """
             INSERT INTO tutor_profiles
-                (user_id, bio, subjects, style_affinity, hourly_rate_sol, rating)
-            VALUES (%s, %s, %s, %s, %s, %s)
+                (user_id, bio, subjects, style_affinity, hourly_rate_sol, rating, teaching_levels)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (user_id) DO UPDATE SET
                 bio             = EXCLUDED.bio,
                 subjects        = EXCLUDED.subjects,
                 style_affinity  = EXCLUDED.style_affinity,
                 hourly_rate_sol = EXCLUDED.hourly_rate_sol,
-                rating          = EXCLUDED.rating
+                rating          = EXCLUDED.rating,
+                teaching_levels = EXCLUDED.teaching_levels
             """,
-            (t.auth_sub, t.bio, t.subjects, Json(t.style), t.hourly_rate_sol, t.rating),
+            (t.auth_sub, t.bio, t.subjects, Json(t.style), t.hourly_rate_sol, t.rating,
+             t.teaching_levels),
         )
         print(f"  {t.auth_sub}  {t.name:<20} {', '.join(t.subjects)}")
 
