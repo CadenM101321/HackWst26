@@ -14,7 +14,7 @@ In views and templates:
 import logging
 import os
 from functools import wraps
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 from authlib.integrations.base_client.errors import OAuthError
 from authlib.integrations.flask_client import OAuth
@@ -89,31 +89,49 @@ def _not_configured():
             "AUTH0_CLIENT_SECRET to .env and restart."), 503
 
 
-@auth.route("/login")
-def login():
+def _safe_next():
+    """Where to go after login, from ?next= - only if it's on this site's hostname.
+
+    Lets the video call, on another port, send people here to log in and get
+    them back to the call. A destination on any other hostname is ignored, so
+    the parameter can't be abused to forward users to a lookalike site.
+    """
+    target = request.args.get("next", "")
+    if not target:
+        return None
+    dest = urlparse(target)
+    site = urlparse(_base_url() or request.host_url)
+    if dest.scheme in ("http", "https") and dest.hostname and dest.hostname == site.hostname:
+        return target
+    return None
+
+
+def _start_login(**auth0_params):
+    """Shared by /login and /signup."""
+    destination = _safe_next()
     if session.get("user"):
-        return redirect(url_for("views.home"))
+        return redirect(destination or url_for("views.home"))
     if (bounce := _on_wrong_host()) is not None:
         return bounce
     client = _auth0()
     if client is None:
         return _not_configured()
-    return client.authorize_redirect(redirect_uri=_external_url("auth.callback"))
+    if destination:
+        session["next"] = destination
+    else:
+        session.pop("next", None)
+    return client.authorize_redirect(redirect_uri=_external_url("auth.callback"), **auth0_params)
+
+
+@auth.route("/login")
+def login():
+    return _start_login()
 
 
 @auth.route("/signup")
 def signup():
     """Same flow as login, but Auth0 opens on its sign-up tab."""
-    if session.get("user"):
-        return redirect(url_for("views.home"))
-    if (bounce := _on_wrong_host()) is not None:
-        return bounce
-    client = _auth0()
-    if client is None:
-        return _not_configured()
-    return client.authorize_redirect(
-        redirect_uri=_external_url("auth.callback"), screen_hint="signup"
-    )
+    return _start_login(screen_hint="signup")
 
 
 @auth.route("/callback")
@@ -154,7 +172,8 @@ def callback():
         # Role lives in TigerData, not Auth0, so read it back from the row.
         "role": row.get("role", "student"),
     }
-    return redirect(url_for("views.home"))
+    # Back to wherever login was started from - e.g. the video call - if set.
+    return redirect(session.pop("next", None) or url_for("views.home"))
 
 
 @auth.route("/logout")
