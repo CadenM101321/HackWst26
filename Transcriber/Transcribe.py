@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -214,34 +215,71 @@ def generate_notes(client: genai.Client, segments: List[Segment]) -> List[Highli
  
  
 # ---------- glue ----------
- 
+
+# ffmpeg's default MP3 is 128 kbit/s: 16 KB per second of audio.
+AUDIO_BYTES_PER_MINUTE = 16_000 * 60
+
+
+def _rate_limit_wait(err: Exception) -> float | None:
+    """Seconds Gemini asks us to wait if this is a rate-limit (429) error, else None."""
+    text = str(err)
+    if getattr(err, "status_code", None) != 429 and "429" not in text and "quota" not in text.lower():
+        return None
+    match = re.search(r"retry in ([\d.]+)s", text)
+    return min(float(match.group(1)) + 1, 90) if match else 30
+
+
+def with_retries(step, name: str, attempts: int = 5):
+    """Run one Gemini step, trying again after a timeout or a temporary error.
+
+    Rate limits (the free tier allows only a few requests a minute) wait as long
+    as Gemini asks; other errors retry after a short pause.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            return step()
+        except Exception as err:
+            if attempt == attempts:
+                raise
+            wait = _rate_limit_wait(err)
+            reason = "rate limited" if wait else f"{type(err).__name__}: {str(err)[:200]}"
+            wait = wait or 2 * attempt
+            print(f"  {name} failed ({reason}); retrying in {wait:.0f}s ({attempt + 1}/{attempts})...")
+            time.sleep(wait)
+
+
 def run_pipeline(video_path: str, output_path: str = "session_output.json") -> dict:
     """
     Runs the full pipeline on a video/audio file and returns the result dict
     ({"video_path", "segments", "highlights"}). Pass output_path=None to skip
     writing a JSON file (e.g. when called from a web endpoint).
     """
-    client = genai.Client()  # reads GEMINI_API_KEY from env
-
     print("Extracting audio...")
     audio_path = extract_audio(video_path)
 
+    # A Gemini request can occasionally hang and never answer. Without a timeout
+    # the call's notes would stay "processing" forever, so give every request a
+    # deadline that grows with the recording's length, then retry it.
+    audio_minutes = os.path.getsize(audio_path) / AUDIO_BYTES_PER_MINUTE
+    timeout_sec = int(120 + 30 * audio_minutes)
+    client = genai.Client(http_options={"timeout": timeout_sec * 1000})  # reads GEMINI_API_KEY from env
+
     try:
         print("Uploading audio to Gemini...")
-        audio_file = upload_and_wait(client, audio_path)
+        audio_file = with_retries(lambda: upload_and_wait(client, audio_path), "upload")
     finally:
         # Once uploaded, the local audio copy is no longer needed.
         if os.path.exists(audio_path):
             os.remove(audio_path)
 
-    print("Transcribing with word-level timestamps...")
-    words = transcribe_with_word_timestamps(client, audio_file)
+    print(f"Transcribing with word-level timestamps (timeout {timeout_sec}s per try)...")
+    words = with_retries(lambda: transcribe_with_word_timestamps(client, audio_file), "transcription")
 
     print(f"Got {len(words)} words. Grouping into segments...")
     segments = group_into_segments(words)
 
     print(f"Built {len(segments)} segments. Generating notes/highlights...")
-    highlights = generate_notes(client, segments)
+    highlights = with_retries(lambda: generate_notes(client, segments), "notes")
 
     result = {
         "video_path": video_path,

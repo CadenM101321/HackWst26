@@ -123,6 +123,7 @@ def process_recording(session_id: str, recording: Path) -> None:
     """Transcribe a call, write notes.json + notes.md beside the recording, then
     store the same notes in TigerData. Runs after the upload response is sent,
     so the server keeps serving chats and calls while Gemini works."""
+    (recording.parent / "error.txt").unlink(missing_ok=True)   # clear a failure from an earlier try
     try:
         result = run_pipeline(str(recording), output_path=None)
         session = get_session(session_id) or {}
