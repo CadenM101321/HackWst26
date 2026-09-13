@@ -1,0 +1,130 @@
+{% extends "base.html" %}
+{% block title %}Set up your profile{% endblock %}
+
+{% macro radio_group(question, prefix) %}
+  {% set name = prefix ~ question.id %}
+  <fieldset class="form-group mb-4">
+    <legend class="col-form-label font-weight-bold pt-0">{{ question.prompt }}</legend>
+    {% if question.free_text %}
+      <textarea class="form-control" name="{{ name }}" rows="2" maxlength="500">{{ values.get(name) or '' }}</textarea>
+    {% else %}
+      {% for option in question.options %}
+        <div class="custom-control custom-radio">
+          <input class="custom-control-input" type="radio" required
+                 id="{{ name }}-{{ option.value }}" name="{{ name }}" value="{{ option.value }}"
+                 {% if values.get(name) == option.value %}checked{% endif %}>
+          <label class="custom-control-label" for="{{ name }}-{{ option.value }}">{{ option.label }}</label>
+        </div>
+      {% endfor %}
+    {% endif %}
+  </fieldset>
+{% endmacro %}
+
+{% block content %}
+<div class="card my-4 shadow-sm">
+  <div class="card-body">
+    <h1 class="h3 mb-1">Set up your profile</h1>
+    <p class="text-muted mb-4">We use your answers to match students with tutors whose teaching style fits how they learn.</p>
+
+    {% if errors %}
+      <div class="alert alert-danger">
+        <ul class="mb-0">{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul>
+      </div>
+    {% endif %}
+
+    <form method="POST" action="{{ url_for('views.onboarding') }}">
+
+      <h2 class="h5">1. I am a...</h2>
+      <div class="btn-group btn-group-toggle d-flex mb-4" data-toggle="buttons">
+        <label class="btn btn-outline-success w-100 {% if values.get('role') == 'student' %}active{% endif %}">
+          <input type="radio" name="role" value="student" required {% if values.get('role') == 'student' %}checked{% endif %}> Student
+        </label>
+        <label class="btn btn-outline-success w-100 {% if values.get('role') == 'tutor' %}active{% endif %}">
+          <input type="radio" name="role" value="tutor" required {% if values.get('role') == 'tutor' %}checked{% endif %}> Tutor
+        </label>
+      </div>
+
+      <h2 class="h5">2. Subjects</h2>
+      <div class="mb-4">
+        {% for s in subjects %}
+          <div class="custom-control custom-checkbox custom-control-inline">
+            <input class="custom-control-input" type="checkbox" id="subject-{{ s.value }}" name="subjects" value="{{ s.value }}"
+                   {% if s.value in (values.get('subjects') or []) %}checked{% endif %}>
+            <label class="custom-control-label" for="subject-{{ s.value }}">{{ s.label }}</label>
+          </div>
+        {% endfor %}
+      </div>
+
+      {# ---------------- student ---------------- #}
+      <div id="student-section" class="role-section" data-role="student" hidden>
+        <h2 class="h5">3. Your grade level</h2>
+        <div class="mb-4">
+          {% for lvl in grade_levels %}
+            <div class="custom-control custom-radio custom-control-inline">
+              <input class="custom-control-input" type="radio" required id="grade-{{ lvl.value }}" name="grade_level" value="{{ lvl.value }}"
+                     {% if values.get('grade_level') == lvl.value %}checked{% endif %}>
+              <label class="custom-control-label" for="grade-{{ lvl.value }}">{{ lvl.label }}</label>
+            </div>
+          {% endfor %}
+        </div>
+
+        <h2 class="h5">4. How do you learn?</h2>
+        {% for q in quiz_questions %}{{ radio_group(q, 'learn_') }}{% endfor %}
+      </div>
+
+      {# ---------------- tutor ---------------- #}
+      <div id="tutor-section" class="role-section" data-role="tutor" hidden>
+        <h2 class="h5">3. Levels you teach</h2>
+        <div class="mb-4">
+          {% for lvl in grade_levels %}
+            <div class="custom-control custom-checkbox custom-control-inline">
+              <input class="custom-control-input" type="checkbox" id="teach-level-{{ lvl.value }}" name="teaching_levels" value="{{ lvl.value }}"
+                     {% if lvl.value in (values.get('teaching_levels') or []) %}checked{% endif %}>
+              <label class="custom-control-label" for="teach-level-{{ lvl.value }}">{{ lvl.label }}</label>
+            </div>
+          {% endfor %}
+        </div>
+
+        <h2 class="h5">4. About you</h2>
+        <div class="form-group">
+          <label for="bio">Short bio - students see this on your match card</label>
+          <textarea class="form-control" id="bio" name="bio" rows="3" maxlength="1000" required>{{ values.get('bio') or '' }}</textarea>
+        </div>
+        <div class="form-group mb-4">
+          <label for="rate">Hourly rate (SOL)</label>
+          <input class="form-control" id="rate" type="number" name="hourly_rate_sol" step="0.01" min="0.01" max="{{ max_rate }}" required
+                 value="{{ values.get('hourly_rate_sol') or '' }}" style="max-width: 12rem;">
+        </div>
+
+        <h2 class="h5">5. How do you teach?</h2>
+        {% for q in teaching_questions %}{{ radio_group(q, 'teach_') }}{% endfor %}
+      </div>
+
+      <p id="role-hint" class="text-muted">Choose student or tutor to continue.</p>
+      <button type="submit" id="submit" class="btn btn-success btn-lg" hidden>Save profile</button>
+    </form>
+  </div>
+</div>
+
+<script>
+  // Show only the chosen role's questions. Inputs in the hidden section are
+  // disabled so the browser neither submits them nor blocks on them being required.
+  (function () {
+    const sections = document.querySelectorAll('.role-section');
+    function show(role) {
+      sections.forEach(function (section) {
+        const active = section.dataset.role === role;
+        section.hidden = !active;
+        section.querySelectorAll('input, textarea').forEach(function (el) { el.disabled = !active; });
+      });
+      document.getElementById('submit').hidden = !role;
+      document.getElementById('role-hint').hidden = !!role;
+    }
+    document.querySelectorAll('input[name="role"]').forEach(function (radio) {
+      radio.addEventListener('change', function () { show(radio.value); });
+    });
+    const checked = document.querySelector('input[name="role"]:checked');
+    show(checked ? checked.value : null);
+  })();
+</script>
+{% endblock %}
