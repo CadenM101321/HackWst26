@@ -85,6 +85,7 @@ let makingOffer = false;
 let ignoreOffer = false;
 let mediaRecorder = null;
 let recordedChunks = [];
+let recordingMix = null;
 const isPolite = myClientId === 'tutor';
 const pendingCandidates = [];
 
@@ -140,6 +141,9 @@ async function start() {
     ws.close();
   }
 
+  // Created right on the Join click: browsers only let audio start from a click.
+  if (myClientId === 'tutor' && !recordingMix) createRecordingMix();
+
   try {
     localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
   } catch (err) {
@@ -155,6 +159,7 @@ async function start() {
   localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
 
   pc.ontrack = (e) => {
+    if (e.track.kind === 'audio') addToRecordingMix(new MediaStream([e.track]));
     const remoteVideo = document.getElementById('remoteVideo');
     if (!remoteVideo.srcObject) {
       remoteVideo.srcObject = e.streams[0];
@@ -298,10 +303,39 @@ async function toggleShare() {
   }
 }
 
+// The notes need both voices, but the camera stream only has the tutor's mic.
+// Mix the tutor's mic and the other person's audio into one track to record.
+function createRecordingMix() {
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return;
+  try {
+    const ctx = new Ctx();
+    recordingMix = { ctx, dest: ctx.createMediaStreamDestination(), sources: [] };
+  } catch (err) {
+    console.warn('Audio mixing unavailable, recording only this microphone:', err);
+  }
+}
+
+function addToRecordingMix(stream) {
+  if (!recordingMix || !stream.getAudioTracks().length) return;
+  const source = recordingMix.ctx.createMediaStreamSource(stream);
+  source.connect(recordingMix.dest);
+  recordingMix.sources.push(source);   // keep a reference so it isn't garbage collected
+}
+
 function startRecording() {
   recordedChunks = [];
+  let recordStream = localStream;
+  if (recordingMix) {
+    recordingMix.ctx.resume();
+    addToRecordingMix(localStream);
+    recordStream = new MediaStream([
+      ...localStream.getVideoTracks(),
+      ...recordingMix.dest.stream.getAudioTracks(),
+    ]);
+  }
   try {
-    mediaRecorder = new MediaRecorder(localStream, { mimeType: 'video/webm;codecs=vp8,opus' });
+    mediaRecorder = new MediaRecorder(recordStream, { mimeType: 'video/webm;codecs=vp8,opus' });
   } catch (err) {
     console.error('MediaRecorder not supported:', err);
     return;
@@ -329,19 +363,24 @@ async function endCall() {
     formData.append('role', myClientId);
 
     try {
-      const resp = await fetch(`${VIDEO_APP}/upload_recording`, { method: 'POST', body: formData });
+      // credentials: send the login cookie so the video app knows who's uploading.
+      const resp = await fetch(`${VIDEO_APP}/upload_recording`, {
+        method: 'POST', body: formData, credentials: 'include',
+      });
       const result = await resp.json();
+      if (!resp.ok) throw new Error(result.detail || `HTTP ${resp.status}`);
       console.log('Recording uploaded:', result);
-      appendChat('system', 'Recording saved and sent for processing.');
+      appendChat('system', 'Recording saved. Your notes are being written - open "View transcript" in about a minute.');
     } catch (err) {
       console.error('Upload failed:', err);
-      appendChat('system', 'Recording upload failed.');
+      appendChat('system', 'Recording upload failed: ' + err.message);
     }
   }
 
   if (ws) ws.close();
   if (pc) pc.close();
   if (localStream) localStream.getTracks().forEach(t => t.stop());
+  if (recordingMix) recordingMix.ctx.close();
   document.getElementById('transcriptBtn').style.display = 'inline-block';
   endBtn.textContent = 'Call ended';
 }

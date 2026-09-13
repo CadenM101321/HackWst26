@@ -1,8 +1,10 @@
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import List
  
 from dotenv import load_dotenv
@@ -40,10 +42,25 @@ def format_ts(seconds: float) -> str:
     return f"{m:02d}:{s:02d}"
  
  
-def extract_audio(video_path: str, audio_path: str = "extracted_audio.mp3") -> str:
-    """Pull the audio track out of the tutoring video with ffmpeg."""
+def ffmpeg_exe() -> str:
+    """ffmpeg from PATH if installed, otherwise the copy bundled with imageio-ffmpeg,
+    so a fresh laptop or server works after just `pip install -r requirements.txt`."""
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    import imageio_ffmpeg
+    return imageio_ffmpeg.get_ffmpeg_exe()
+
+
+def extract_audio(video_path: str, audio_path: str | None = None) -> str:
+    """Pull the audio track out of the tutoring video with ffmpeg.
+
+    The audio goes next to the video by default, so two calls being processed
+    at once never write over each other's audio.
+    """
+    audio_path = audio_path or str(Path(video_path).with_suffix(".mp3"))
     result = subprocess.run(
-        ["ffmpeg", "-y", "-i", video_path, "-vn", "-acodec", "libmp3lame", audio_path],
+        [ffmpeg_exe(), "-y", "-i", video_path, "-vn", "-acodec", "libmp3lame", audio_path],
         capture_output=True,
         text=True,
     )
@@ -209,8 +226,13 @@ def run_pipeline(video_path: str, output_path: str = "session_output.json") -> d
     print("Extracting audio...")
     audio_path = extract_audio(video_path)
 
-    print("Uploading audio to Gemini...")
-    audio_file = upload_and_wait(client, audio_path)
+    try:
+        print("Uploading audio to Gemini...")
+        audio_file = upload_and_wait(client, audio_path)
+    finally:
+        # Once uploaded, the local audio copy is no longer needed.
+        if os.path.exists(audio_path):
+            os.remove(audio_path)
 
     print("Transcribing with word-level timestamps...")
     words = transcribe_with_word_timestamps(client, audio_file)
@@ -228,7 +250,7 @@ def run_pipeline(video_path: str, output_path: str = "session_output.json") -> d
     }
 
     if output_path:
-        with open(output_path, "w") as f:
+        with open(output_path, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2)
         print(f"Done. Wrote {output_path}")
 
